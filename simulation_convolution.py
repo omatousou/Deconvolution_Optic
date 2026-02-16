@@ -9,7 +9,11 @@ from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
-
+from scipy.ndimage import gaussian_filter 
+from matplotlib.image import imread
+import sys
+import numpy as np
+from scipy.signal import fftconvolve
 # --- Fonctions Utilitaires ---
 
 def create_smiley(N, radius):
@@ -71,6 +75,8 @@ class OpticalSimulation(QMainWindow):
             img = resize(img, (self.N, self.N), mode='reflect', anti_aliasing=True)
             img = (img - img.min()) / (img.max() - img.min() + 1e-10)
             self.objet = img
+            self.objet = create_smiley(self.N, radius=int(self.N * 0.15))
+
         except Exception:
             self.objet = create_smiley(self.N, radius=int(self.N * 0.15))
 
@@ -260,48 +266,129 @@ class OpticalSimulation(QMainWindow):
         self.canvas_sim.draw()
 
     def update_reconstruction(self):
+        """
+        Implémentation de la déconvolution par Gradient Conjugué (Non-linéaire)
+        Basée sur la méthode décrite : f = x^2, minimisation de l'erreur pondérée.
+        """
         n_angles = self.slider_recon.value()
         self.lbl_count.setText(str(n_angles))
         
+        # 1. Génération des données "observées" (g_i) et des PSF (H_i)
+        # -----------------------------------------------------------
         angles_capture = np.linspace(0, 180, n_angles, endpoint=False)
-        captured_images_fft = [] 
-        psf_ffts = []            
+        observations_g = [] 
+        psfs_H_fft = []            
         
+        # On pré-calcule tout en Fourier pour la vitesse
         for angle in angles_capture:
-            pupil_complex = self.compute_complex_pupil(angle)
-            psf_fft_raw = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(pupil_complex)))
-            psf = np.abs(psf_fft_raw)**2
-            psf /= psf.sum()
-            img_blurred = fftconvolve(self.objet, psf, mode='same')
+            pupil = self.compute_complex_pupil(angle)
+            psf_fft = np.fft.fft2(np.fft.ifftshift(np.abs(np.fft.fftshift(np.fft.fft2(pupil)))**2))
+            # Normalisation de l'énergie de la PSF
+            psf_fft /= (psf_fft[0,0] + 1e-20) 
             
-            captured_images_fft.append(np.fft.fft2(np.fft.ifftshift(img_blurred)))
-            psf_ffts.append(np.fft.fft2(np.fft.ifftshift(psf)))
+            # Création de l'observation g_i (Convolution Objet * PSF)
+            obj_fft = np.fft.fft2(np.fft.ifftshift(self.objet))
+            img_blurred_fft = obj_fft * psf_fft
+            
+            # On stocke g_i (domaine spatial) et H_i (domaine fréquentiel)
+            g_spatial = np.fft.fftshift(np.fft.ifft2(img_blurred_fft).real)
+            observations_g.append(g_spatial)
+            psfs_H_fft.append(psf_fft)
 
-        numerateur = np.zeros_like(captured_images_fft[0], dtype=complex)
-        denominateur = np.zeros_like(captured_images_fft[0], dtype=float)
-        K = 0.0005 
+        # 2. Initialisation pour le Gradient Conjugué
+        # -----------------------------------------------------------
+        # On initialise x par la racine de la moyenne des images (car f = x^2)
+        mean_img = np.mean(observations_g, axis=0)
+        mean_img = np.maximum(mean_img, 0) # Sécurité
+        x_est = np.sqrt(mean_img) 
         
-        for G, H in zip(captured_images_fft, psf_ffts):
-            numerateur += G * np.conj(H)
-            denominateur += np.abs(H)**2
+        # Paramètres de l'algo
+        iterations = 15  # Nombre d'itérations
+        step_size = 0.5  # Pas de descente
+        
+        # Variables pour le Gradient Conjugué
+        d = np.zeros_like(x_est) # Direction de descente
+        g_old_norm = 0
+        
+        # Matrice W : Filtre Gaussien sigma=1 pixel
+        sigma_w = 1.0
+
+        # 3. Boucle d'optimisation (CG)
+        # -----------------------------------------------------------
+        for k in range(iterations):
             
-        F_final = numerateur / (denominateur + K)
-        img_reconstructed = np.fft.ifft2(F_final)
-        img_reconstructed = np.abs(np.fft.fftshift(img_reconstructed))
+            # a. Calcul du Gradient
+            # ---------------------
+            f_est = x_est**2 # f = x^2
+            f_est_fft = np.fft.fft2(np.fft.ifftshift(f_est))
+            
+            grad_sum = np.zeros_like(x_est)
+            
+            for i in range(n_angles):
+                # 1. Calcul du résidu : r = H * f - g
+                Hf_fft = f_est_fft * psfs_H_fft[i]
+                Hf = np.fft.fftshift(np.fft.ifft2(Hf_fft).real)
+                res = Hf - observations_g[i]
+                
+                # 2. Application de W (Lissage du résidu)
+                Wr = gaussian_filter(res, sigma=sigma_w)
+                
+                # 3. Application de W_transpose (encore lissage)
+                WTr = gaussian_filter(Wr, sigma=sigma_w)
+                
+                # 4. Application de H_adjoint (Corrélation)
+                WTr_fft = np.fft.fft2(np.fft.ifftshift(WTr))
+                term_fft = WTr_fft * np.conj(psfs_H_fft[i])
+                term_spatial = np.fft.fftshift(np.fft.ifft2(term_fft).real)
+                
+                grad_sum += term_spatial
+            
+            # Gradient final : 4 * x * Somme(...)
+            grad = 4 * x_est * grad_sum
+
+            # b. Mise à jour de la direction
+            if k == 0:
+                d = -grad
+            else:
+                g_curr_norm = np.sum(grad**2)
+                beta = g_curr_norm / (g_old_norm + 1e-20)
+                d = -grad + beta * d
+                
+            g_old_norm = np.sum(grad**2)
+            
+            # c. Mise à jour de x
+            current_step = step_size / (np.max(np.abs(d)) + 1e-10)
+            x_est = x_est + current_step * d
+        
+        # 4. Résultat final
+        # -----------------------------------------------------------
+        # C'est la ligne qui manquait : on convertit x en image finale f
+        img_reconstructed = x_est**2 
+
+        rec_min = img_reconstructed.min()
+        rec_max = img_reconstructed.max()
+        
+        if rec_max > rec_min:
+            img_view = (img_reconstructed - rec_min) / (rec_max - rec_min)
+        else:
+            img_view = img_reconstructed
 
         self.im_recon_orig.set_data(self.objet)
-        img_recon_clipped = np.clip(img_reconstructed, 0, 1)
-        self.im_recon_result.set_data(gamma_correction(img_recon_clipped, 0.6))
-        self.ax_recon_result.set_title(f"2. Reconstruction ({n_angles} angles)", fontsize=10)
+        
+        # Affichage normalisé SANS gamma
+        self.im_recon_result.set_data(img_view)
+        self.im_recon_result.set_clim(0, 1)
+        
+        self.ax_recon_result.set_title(f"2. Deconv CG ({n_angles} vues, {iterations} itér.)", fontsize=10)
 
-        img_diff = np.abs(self.objet - img_recon_clipped)
+        # Différence map améliorée
+        img_diff = np.abs(self.objet - img_view)
         self.im_recon_diff.set_data(img_diff)
-        max_diff = img_diff.max()
-        clim_max = max_diff if max_diff > 1e-3 else 0.1
-        self.im_recon_diff.set_clim(0, clim_max)
+        
+        # Seuil de saturation pour l'erreur
+        self.im_recon_diff.set_clim(0, 0.3) 
 
         self.canvas_recon.draw()
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = OpticalSimulation()
